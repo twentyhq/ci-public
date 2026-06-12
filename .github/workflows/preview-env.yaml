@@ -3,9 +3,9 @@ name: Preview Environment
 # Dispatched from twentyhq/twenty's `.github/workflows/preview-env-dispatch.yaml`.
 #
 # Runs the attacker-controlled `docker-compose.yml` and `Dockerfile` from
-# the PR head SHA. Living in a public repo keeps the Actions minutes free:
-# `repository_dispatch` can only be fired by a token with write access to
-# this repo, so being public exposes run logs but not secrets.
+# the PR head SHA. `repository_dispatch` can only be fired by a token with
+# write access to this repo, so being public exposes run logs but not
+# secrets.
 #
 # The checkout is tokenless (twenty is public) with persist-credentials
 # disabled, and the GitHub App token is minted only for the PR-comment
