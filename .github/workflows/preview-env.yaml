@@ -3,17 +3,19 @@ name: Preview Environment
 # Dispatched from twentyhq/twenty's `.github/workflows/preview-env-dispatch.yaml`.
 #
 # Runs the attacker-controlled `docker-compose.yml` and `Dockerfile` from
-# the PR head SHA. `repository_dispatch` can only be fired by a token with
-# write access to this repo, so being public exposes run logs but not
-# secrets.
+# the PR head SHA, so this job must be treated as fully compromised: a
+# malicious PR can bind-mount the runner host and read anything in the job.
 #
-# The checkout is tokenless (twenty is public) with persist-credentials
-# disabled, and the GitHub App token is minted only for the PR-comment
-# step — no credential is on disk while the PR's code builds and runs.
+# Therefore no privileged secret lives here. The cloudflared tunnel is
+# started and its URL is dispatched back to ci-privileged BEFORE any
+# attacker-controlled code runs (checkout/build/up), so the dispatch token
+# is never present on the runner while untrusted code executes.
+# ci-privileged holds the GitHub App key and posts the PR comment.
 #
-# The DOCKERHUB_RO_TOKEN credential is a Dockerhub PAT with
-# "Public Repo Read-only" scope — equivalent to anonymous access plus
-# rate-limit headroom — so it intentionally carries no exfiltration risk.
+# The only credential reachable by attacker code is DOCKERHUB_RO_TOKEN, a
+# Dockerhub PAT with "Public Repo Read-only" scope — equivalent to
+# anonymous access plus rate-limit headroom — so it carries no
+# exfiltration risk.
 
 on:
   repository_dispatch:
@@ -26,6 +28,76 @@ jobs:
     timeout-minutes: 310
     runs-on: ubuntu-latest
     steps:
+      - name: Create Tunnel
+        id: expose-tunnel
+        env:
+          CLOUDFLARED_VERSION: '2026.3.0'
+        run: |
+          set -euo pipefail
+
+          # Install cloudflared (pinned for reproducibility)
+          sudo curl -fsSL -o /usr/local/bin/cloudflared \
+            "https://github.com/cloudflare/cloudflared/releases/download/${CLOUDFLARED_VERSION}/cloudflared-linux-amd64"
+          sudo chmod +x /usr/local/bin/cloudflared
+          cloudflared --version
+
+          # Start an account-less "quick tunnel" pointing at the (not-yet-running)
+          # server container. Cloudflare assigns the https://*.trycloudflare.com
+          # URL immediately — before the backend exists — so it can be handed off
+          # before any attacker-controlled code runs.
+          log_file="$RUNNER_TEMP/cloudflared.log"
+          : > "$log_file"
+
+          cloudflared tunnel \
+            --url http://localhost:3000 \
+            --no-autoupdate \
+            --logfile "$log_file" \
+            --loglevel info \
+            > "$RUNNER_TEMP/cloudflared.stdout" 2>&1 &
+
+          pid=$!
+          echo "$pid" > "$RUNNER_TEMP/cloudflared.pid"
+          echo "cloudflared PID: $pid"
+
+          # Wait up to 2 minutes for the URL to appear; fail fast if cloudflared exits.
+          url=''
+          for _ in $(seq 1 60); do
+            url=$(grep -oE 'https://[a-zA-Z0-9-]+\.trycloudflare\.com' "$log_file" 2>/dev/null | head -n1 || true)
+            [ -n "$url" ] && break
+            if ! kill -0 "$pid" 2>/dev/null; then
+              echo "cloudflared exited before producing a URL"
+              cat "$log_file" || true
+              exit 1
+            fi
+            sleep 2
+          done
+
+          if [ -z "$url" ]; then
+            echo "Timed out waiting for tunnel URL"
+            cat "$log_file" || true
+            exit 1
+          fi
+
+          echo "Tunnel URL: $url"
+          echo "tunnel-url=$url" >> "$GITHUB_OUTPUT"
+
+      - name: Dispatch PR comment to ci-privileged
+        # Runs BEFORE any attacker-controlled code (checkout/build/up). This is
+        # the only step that references a token, and it is gone from the
+        # environment before untrusted code executes. Scope the token to
+        # repository_dispatch on ci-privileged only.
+        env:
+          GH_TOKEN: ${{ secrets.CI_PRIVILEGED_DISPATCH_TOKEN }}
+          PR_NUMBER: ${{ github.event.client_payload.pr_number }}
+          TARGET_REPO: ${{ github.event.client_payload.repo }}
+          TUNNEL_URL: ${{ steps.expose-tunnel.outputs.tunnel-url }}
+        run: |
+          gh api repos/twentyhq/ci-privileged/dispatches \
+            -f event_type=preview-env-comment \
+            -f "client_payload[pr_number]=$PR_NUMBER" \
+            -f "client_payload[repo]=$TARGET_REPO" \
+            -f "client_payload[tunnel_url]=$TUNNEL_URL"
+
       - name: Checkout twentyhq/twenty at PR head
         uses: actions/checkout@v5
         with:
@@ -74,57 +146,6 @@ jobs:
           docker compose build
         working-directory: ./
 
-      - name: Create Tunnel
-        id: expose-tunnel
-        env:
-          CLOUDFLARED_VERSION: '2026.3.0'
-        run: |
-          set -euo pipefail
-
-          # Install cloudflared (pinned for reproducibility)
-          sudo curl -fsSL -o /usr/local/bin/cloudflared \
-            "https://github.com/cloudflare/cloudflared/releases/download/${CLOUDFLARED_VERSION}/cloudflared-linux-amd64"
-          sudo chmod +x /usr/local/bin/cloudflared
-          cloudflared --version
-
-          # Start an account-less "quick tunnel" pointing at the server container.
-          # Cloudflare prints the assigned https://*.trycloudflare.com URL into the log.
-          log_file="$RUNNER_TEMP/cloudflared.log"
-          : > "$log_file"
-
-          cloudflared tunnel \
-            --url http://localhost:3000 \
-            --no-autoupdate \
-            --logfile "$log_file" \
-            --loglevel info \
-            > "$RUNNER_TEMP/cloudflared.stdout" 2>&1 &
-
-          pid=$!
-          echo "$pid" > "$RUNNER_TEMP/cloudflared.pid"
-          echo "cloudflared PID: $pid"
-
-          # Wait up to 2 minutes for the URL to appear; fail fast if cloudflared exits.
-          url=''
-          for _ in $(seq 1 60); do
-            url=$(grep -oE 'https://[a-zA-Z0-9-]+\.trycloudflare\.com' "$log_file" 2>/dev/null | head -n1 || true)
-            [ -n "$url" ] && break
-            if ! kill -0 "$pid" 2>/dev/null; then
-              echo "cloudflared exited before producing a URL"
-              cat "$log_file" || true
-              exit 1
-            fi
-            sleep 2
-          done
-
-          if [ -z "$url" ]; then
-            echo "Timed out waiting for tunnel URL"
-            cat "$log_file" || true
-            exit 1
-          fi
-
-          echo "Tunnel URL: $url"
-          echo "tunnel-url=$url" >> "$GITHUB_OUTPUT"
-
       - name: Start services with correct SERVER_URL
         env:
           TUNNEL_URL: ${{ steps.expose-tunnel.outputs.tunnel-url }}
@@ -170,39 +191,6 @@ jobs:
             exit 1
           fi
         working-directory: ./
-
-      - name: Generate GitHub App token
-        id: app-token
-        uses: actions/create-github-app-token@v1
-        with:
-          app-id: ${{ secrets.CI_APP_ID }}
-          private-key: ${{ secrets.CI_APP_PRIVATE_KEY }}
-          owner: twentyhq
-          repositories: twenty
-
-      - name: Post / update PR comment
-        env:
-          GH_TOKEN: ${{ steps.app-token.outputs.token }}
-          PR_NUMBER: ${{ github.event.client_payload.pr_number }}
-          TARGET_REPO: ${{ github.event.client_payload.repo }}
-          TUNNEL_URL: ${{ steps.expose-tunnel.outputs.tunnel-url }}
-        run: |
-          set -euo pipefail
-          MARKER="<!-- PR_PREVIEW_ENV -->"
-          BODY="${MARKER}
-          🚀 **Preview Environment Ready!**
-
-          Your preview environment is available at: ${TUNNEL_URL}
-
-          This environment will automatically shut down after 5 hours."
-
-          COMMENT_ID=$(gh api "repos/${TARGET_REPO}/issues/${PR_NUMBER}/comments" \
-            --paginate --jq ".[] | select(.body | startswith(\"${MARKER}\")) | .id" | head -1)
-          if [ -n "$COMMENT_ID" ]; then
-            gh api "repos/${TARGET_REPO}/issues/comments/${COMMENT_ID}" -X PATCH -f body="$BODY"
-          else
-            gh api "repos/${TARGET_REPO}/issues/${PR_NUMBER}/comments" -f body="$BODY"
-          fi
 
       - name: Keep tunnel alive for 5 hours
         run: timeout 300m sleep 18000 # Stop on whichever we reach first (300m or 5hour sleep)
