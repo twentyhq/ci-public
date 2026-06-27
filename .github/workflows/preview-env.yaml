@@ -1,6 +1,7 @@
 name: Preview Environment
 
-# Dispatched from twentyhq/twenty's `.github/workflows/preview-env-dispatch.yaml`.
+# Dispatched from twentyhq/twenty's `.github/workflows/preview-env-dispatch.yaml`
+# via workflow_dispatch.
 #
 # Runs the attacker-controlled `docker-compose.yml` and `Dockerfile` from
 # the PR head SHA, so this job must be treated as fully compromised: a
@@ -12,14 +13,29 @@ name: Preview Environment
 # is never present on the runner while untrusted code executes.
 # ci-privileged holds the GitHub App key and posts the PR comment.
 #
+# Lives in the PUBLIC ci-public repo so the 5h keepalive runs on free
+# Actions minutes (private repos bill them).
+#
 # The only credential reachable by attacker code is DOCKERHUB_RO_TOKEN, a
 # Dockerhub PAT with "Public Repo Read-only" scope — equivalent to
 # anonymous access plus rate-limit headroom — so it carries no
 # exfiltration risk.
 
 on:
-  repository_dispatch:
-    types: [preview-environment]
+  workflow_dispatch:
+    inputs:
+      pr_number:
+        description: 'PR number on twentyhq/twenty'
+        required: true
+        type: string
+      pr_head_sha:
+        description: 'PR head SHA to check out and build'
+        required: true
+        type: string
+      repo:
+        description: 'Source repo (owner/name)'
+        required: true
+        type: string
 
 permissions: {}
 
@@ -84,25 +100,26 @@ jobs:
       - name: Dispatch PR comment to ci-privileged
         # Runs BEFORE any attacker-controlled code (checkout/build/up). This is
         # the only step that references a token, and it is gone from the
-        # environment before untrusted code executes. Scope the token to
-        # repository_dispatch on ci-privileged only.
+        # environment before untrusted code executes. CI_PRIVILEGED_DISPATCH_TOKEN
+        # is a fine-grained PAT scoped to actions:write on ci-privileged only —
+        # an App key is deliberately NOT used here, to keep it off this runner.
         env:
           GH_TOKEN: ${{ secrets.CI_PRIVILEGED_DISPATCH_TOKEN }}
-          PR_NUMBER: ${{ github.event.client_payload.pr_number }}
-          TARGET_REPO: ${{ github.event.client_payload.repo }}
+          PR_NUMBER: ${{ inputs.pr_number }}
+          TARGET_REPO: ${{ inputs.repo }}
           TUNNEL_URL: ${{ steps.expose-tunnel.outputs.tunnel-url }}
         run: |
-          gh api repos/twentyhq/ci-privileged/dispatches \
-            -f event_type=preview-env-comment \
-            -f "client_payload[pr_number]=$PR_NUMBER" \
-            -f "client_payload[repo]=$TARGET_REPO" \
-            -f "client_payload[tunnel_url]=$TUNNEL_URL"
+          set -euo pipefail
+          gh workflow run preview-env-comment.yaml --repo twentyhq/ci-privileged --ref main \
+            -f pr_number="$PR_NUMBER" \
+            -f repo="$TARGET_REPO" \
+            -f tunnel_url="$TUNNEL_URL"
 
       - name: Checkout twentyhq/twenty at PR head
         uses: actions/checkout@v5
         with:
           repository: twentyhq/twenty
-          ref: ${{ github.event.client_payload.pr_head_sha }}
+          ref: ${{ inputs.pr_head_sha }}
           persist-credentials: false
 
       - name: Login to Docker Hub (read-only PAT)
