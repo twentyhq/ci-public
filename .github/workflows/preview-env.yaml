@@ -7,21 +7,20 @@ name: Preview Environment
 # the PR head SHA, so this job must be treated as fully compromised: a
 # malicious PR can bind-mount the runner host and read anything in the job.
 #
-# Therefore no high-value secret lives here. The cloudflared tunnel is started
-# and its URL is dispatched back to ci-privileged BEFORE any attacker-controlled
-# code runs (checkout/build/up). The dispatch uses a short-lived token from a
-# dedicated, minimal GitHub App (actions:write on ci-privileged only), revoked
-# immediately after use — so no usable credential remains on the runner while
-# untrusted code executes. ci-privileged holds the App key that can write to
-# twenty and posts the PR comment.
+# Therefore no secret is reachable by attacker code at all. The cloudflared
+# tunnel is started and its URL is dispatched back to ci-privileged BEFORE any
+# attacker-controlled code runs (checkout/build/up). The dispatch uses a
+# short-lived token from a dedicated, minimal GitHub App (actions:write on
+# ci-privileged only), revoked immediately after use — so no usable credential
+# remains on the runner while untrusted code executes. ci-privileged holds the
+# App key that can write to twenty and posts the PR comment.
+#
+# Base images (postgres, redis, node) are pulled anonymously through a public
+# pull-through mirror (mirror.gcr.io) configured below, which avoids Docker
+# Hub's anonymous rate limits without any credential.
 #
 # Lives in the PUBLIC ci-public repo so the 5h keepalive runs on free
 # Actions minutes (private repos bill them).
-#
-# The only credential reachable by attacker code is DOCKERHUB_RO_TOKEN, a
-# Dockerhub PAT with "Public Repo Read-only" scope — equivalent to
-# anonymous access plus rate-limit headroom — so it carries no
-# exfiltration risk.
 
 on:
   workflow_dispatch:
@@ -143,15 +142,17 @@ jobs:
           ref: ${{ inputs.pr_head_sha }}
           persist-credentials: false
 
-      - name: Login to Docker Hub (read-only PAT)
-        # Scope-named credential: vars.DOCKERHUB_RO_USERNAME +
-        # secrets.DOCKERHUB_RO_TOKEN must be a Dockerhub PAT with
-        # "Public Repo Read-only" scope. The naming carries the scope
-        # so the least-privilege expectation survives future edits.
-        uses: docker/login-action@c94ce9fb468520275223c153574b00df6fe4bcc9 # v3.7.0
-        with:
-          username: ${{ vars.DOCKERHUB_RO_USERNAME }}
-          password: ${{ secrets.DOCKERHUB_RO_TOKEN }}
+      - name: Route Docker Hub pulls through a public mirror (no credentials)
+        # Public base images (postgres, redis, node) go through Google's
+        # mirror.gcr.io pull-through cache, which has far higher anonymous limits
+        # than Docker Hub — so no Docker Hub credential is needed on this runner.
+        run: |
+          set -euo pipefail
+          echo '{ "registry-mirrors": ["https://mirror.gcr.io"] }' | sudo tee /etc/docker/daemon.json
+          sudo systemctl restart docker
+          # Wait for the daemon to come back up before anything tries to use it.
+          for _ in $(seq 1 30); do docker info >/dev/null 2>&1 && break; sleep 1; done
+          docker info | sed -n '/Registry Mirrors/,/Live Restore/p' || true
 
       - name: Run compose setup
         run: |
