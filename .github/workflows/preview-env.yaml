@@ -7,11 +7,13 @@ name: Preview Environment
 # the PR head SHA, so this job must be treated as fully compromised: a
 # malicious PR can bind-mount the runner host and read anything in the job.
 #
-# Therefore no privileged secret lives here. The cloudflared tunnel is
-# started and its URL is dispatched back to ci-privileged BEFORE any
-# attacker-controlled code runs (checkout/build/up), so the dispatch token
-# is never present on the runner while untrusted code executes.
-# ci-privileged holds the GitHub App key and posts the PR comment.
+# Therefore no high-value secret lives here. The cloudflared tunnel is started
+# and its URL is dispatched back to ci-privileged BEFORE any attacker-controlled
+# code runs (checkout/build/up). The dispatch uses a short-lived token from a
+# dedicated, minimal GitHub App (actions:write on ci-privileged only), revoked
+# immediately after use — so no usable credential remains on the runner while
+# untrusted code executes. ci-privileged holds the App key that can write to
+# twenty and posts the PR comment.
 #
 # Lives in the PUBLIC ci-public repo so the 5h keepalive runs on free
 # Actions minutes (private repos bill them).
@@ -97,14 +99,30 @@ jobs:
           echo "Tunnel URL: $url"
           echo "tunnel-url=$url" >> "$GITHUB_OUTPUT"
 
+      # Mint a short-lived installation token from a DEDICATED, minimal GitHub
+      # App whose only permission is actions:write on ci-privileged. Even if it
+      # leaked, the blast radius is "trigger workflows on ci-privileged" — same
+      # as a scoped PAT, but org-owned and auto-expiring. This runs BEFORE any
+      # attacker-controlled code, and the token is revoked right after use below.
+      - name: Mint ci-privileged dispatch token
+        id: dispatch-token
+        uses: actions/create-github-app-token@bcd2ba49218906704ab6c1aa796996da409d3eb1 # v3.2.0
+        with:
+          client-id: ${{ vars.PREVIEW_DISPATCH_APP_CLIENT_ID }}
+          private-key: ${{ secrets.PREVIEW_DISPATCH_APP_PRIVATE_KEY }}
+          owner: twentyhq
+          repositories: ci-privileged
+          permission-actions: write
+          # Revoked explicitly right after use (below), so skip the action's
+          # end-of-job revoke which would otherwise run after untrusted code.
+          skip-token-revoke: true
+
       - name: Dispatch PR comment to ci-privileged
-        # Runs BEFORE any attacker-controlled code (checkout/build/up). This is
-        # the only step that references a token, and it is gone from the
-        # environment before untrusted code executes. CI_PRIVILEGED_DISPATCH_TOKEN
-        # is a fine-grained PAT scoped to actions:write on ci-privileged only —
-        # an App key is deliberately NOT used here, to keep it off this runner.
+        # Runs BEFORE any attacker-controlled code (checkout/build/up). The token
+        # is used and then immediately revoked, so no usable credential remains
+        # on the runner while untrusted code executes.
         env:
-          GH_TOKEN: ${{ secrets.CI_PRIVILEGED_DISPATCH_TOKEN }}
+          GH_TOKEN: ${{ steps.dispatch-token.outputs.token }}
           PR_NUMBER: ${{ inputs.pr_number }}
           TARGET_REPO: ${{ inputs.repo }}
           TUNNEL_URL: ${{ steps.expose-tunnel.outputs.tunnel-url }}
@@ -114,6 +132,9 @@ jobs:
             -f pr_number="$PR_NUMBER" \
             -f repo="$TARGET_REPO" \
             -f tunnel_url="$TUNNEL_URL"
+          # Revoke the installation token now — before checkout/build/up — so it
+          # can't be exfiltrated by attacker-controlled code later in the job.
+          gh api --method DELETE /installation/token || true
 
       - name: Checkout twentyhq/twenty at PR head
         uses: actions/checkout@v5
