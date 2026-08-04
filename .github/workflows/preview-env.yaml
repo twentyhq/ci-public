@@ -171,10 +171,6 @@ jobs:
           echo "Adding SIGN_IN_PREFILLED environment variable to server service..."
           yq eval '.services.server.environment.SIGN_IN_PREFILLED = "${SIGN_IN_PREFILLED}"' -i packages/twenty-docker/docker-compose.yml
 
-          # Preview apps run NODE_ENV=production with billing off, which otherwise
-          # hides the admin panel's Feature Flags tab. Set explicitly here rather
-          # than relying on the compose default so it works on PRs whose base
-          # predates the variable being plumbed into docker-compose.yml.
           echo "Adding IS_FEATURE_FLAG_MANAGEMENT_ENABLED environment variable to server service..."
           yq eval '.services.server.environment.IS_FEATURE_FLAG_MANAGEMENT_ENABLED = "${IS_FEATURE_FLAG_MANAGEMENT_ENABLED}"' -i packages/twenty-docker/docker-compose.yml
 
