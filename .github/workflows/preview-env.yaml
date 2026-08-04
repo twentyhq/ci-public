@@ -171,6 +171,9 @@ jobs:
           echo "Adding SIGN_IN_PREFILLED environment variable to server service..."
           yq eval '.services.server.environment.SIGN_IN_PREFILLED = "${SIGN_IN_PREFILLED}"' -i packages/twenty-docker/docker-compose.yml
 
+          echo "Adding IS_FEATURE_FLAG_MANAGEMENT_ENABLED environment variable to server service..."
+          yq eval '.services.server.environment.IS_FEATURE_FLAG_MANAGEMENT_ENABLED = "${IS_FEATURE_FLAG_MANAGEMENT_ENABLED}"' -i packages/twenty-docker/docker-compose.yml
+
           echo "Setting up .env file..."
           cp packages/twenty-docker/.env.example packages/twenty-docker/.env
 
@@ -180,6 +183,7 @@ jobs:
           echo "APP_SECRET=$(openssl rand -base64 32)" >> packages/twenty-docker/.env
           echo "PG_DATABASE_PASSWORD=$(openssl rand -hex 16)" >> packages/twenty-docker/.env
           echo "SIGN_IN_PREFILLED=true" >> packages/twenty-docker/.env
+          echo "IS_FEATURE_FLAG_MANAGEMENT_ENABLED=true" >> packages/twenty-docker/.env
           echo "Docker compose build..."
           cd packages/twenty-docker/
           docker compose build
