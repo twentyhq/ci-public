@@ -35,20 +35,12 @@ on:
         description: 'Source repo (owner/name)'
         required: true
         type: string
-      tunnel_id:
-        description: 'Cloudflare tunnel UUID provisioned for this PR'
-        required: true
-        type: string
       hostname:
         description: 'Stable preview hostname for this PR'
         required: true
         type: string
 
 permissions: {}
-
-concurrency:
-  group: preview-env-${{ inputs.pr_number }}
-  cancel-in-progress: true
 
 jobs:
   preview-environment:
@@ -58,14 +50,13 @@ jobs:
       - name: Start tunnel
         env:
           CLOUDFLARED_VERSION: '2026.3.0'
-          TUNNEL_CREDENTIALS: ${{ secrets[format('PREVIEW_TUNNEL_{0}', inputs.pr_number)] }}
-          TUNNEL_ID: ${{ inputs.tunnel_id }}
+          TUNNEL_TOKEN: ${{ secrets[format('PREVIEW_TUNNEL_{0}', inputs.pr_number)] }}
           PREVIEW_HOST: ${{ inputs.hostname }}
           PR_NUMBER: ${{ inputs.pr_number }}
         run: |
           set -euo pipefail
 
-          if [ -z "$TUNNEL_CREDENTIALS" ]; then
+          if [ -z "$TUNNEL_TOKEN" ]; then
             echo "::error::No PREVIEW_TUNNEL_${PR_NUMBER} secret on this repo."
             echo "::error::ci-privileged sets it before dispatching this workflow."
             exit 1
@@ -76,23 +67,10 @@ jobs:
           sudo chmod +x /usr/local/bin/cloudflared
           cloudflared --version
 
-          cred_file="$RUNNER_TEMP/tunnel-creds.json"
-          printf '%s' "$TUNNEL_CREDENTIALS" > "$cred_file"
-          chmod 600 "$cred_file"
-
-          cat > "$RUNNER_TEMP/tunnel-config.yml" <<EOF
-          tunnel: ${TUNNEL_ID}
-          credentials-file: ${cred_file}
-          ingress:
-            - hostname: ${PREVIEW_HOST}
-              service: http://localhost:3000
-            - service: http_status:404
-          EOF
-
           log_file="$RUNNER_TEMP/cloudflared.log"
           : > "$log_file"
-          cloudflared tunnel --config "$RUNNER_TEMP/tunnel-config.yml" \
-            --no-autoupdate --logfile "$log_file" --loglevel info run \
+          cloudflared tunnel --no-autoupdate --logfile "$log_file" --loglevel info \
+            run --token "$TUNNEL_TOKEN" \
             > "$RUNNER_TEMP/cloudflared.stdout" 2>&1 &
 
           pid=$!
