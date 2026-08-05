@@ -1,25 +1,23 @@
 name: Preview Environment
 
-# Dispatched from twentyhq/twenty's `.github/workflows/preview-env-dispatch.yaml`
-# via workflow_dispatch.
+# Dispatched from twentyhq/ci-privileged's `preview-env-prepare.yaml`.
 #
-# Runs the attacker-controlled `docker-compose.yml` and `Dockerfile` from
-# the PR head SHA, so this job must be treated as fully compromised: a
-# malicious PR can bind-mount the runner host and read anything in the job.
+# Runs the attacker-controlled `docker-compose.yml` and `Dockerfile` from the PR
+# head SHA, so this job must be treated as fully compromised: a malicious PR can
+# bind-mount the runner host and read anything in the job, including process
+# memory belonging to the Actions runner itself.
 #
-# Therefore no secret is reachable by attacker code at all. The cloudflared
-# tunnel is started and its URL is dispatched back to ci-privileged BEFORE any
-# attacker-controlled code runs (checkout/build/up). The dispatch uses a
-# short-lived token from a dedicated, minimal GitHub App (actions:write on
-# ci-privileged only), revoked immediately after use — so no usable credential
-# remains on the runner while untrusted code executes. ci-privileged holds the
-# App key that can write to twenty and posts the PR comment.
+# It therefore holds no GitHub credential of any kind. The hostname is assigned
+# by ci-privileged before this job starts and the PR comment is posted there, so
+# nothing has to be reported back. The only secret here is this one PR's tunnel
+# credentials, whose entire capability is serving traffic on the hostname that
+# is already serving this PR's code.
 #
 # Base images (postgres, redis, node) are pulled anonymously through a public
 # pull-through mirror (mirror.gcr.io) configured below, which avoids Docker
 # Hub's anonymous rate limits without any credential.
 #
-# Lives in the PUBLIC ci-public repo so the 5h keepalive runs on free
+# Lives in the PUBLIC ci-public repo so the long keepalive runs on free
 # Actions minutes (private repos bill them).
 
 on:
@@ -37,103 +35,70 @@ on:
         description: 'Source repo (owner/name)'
         required: true
         type: string
+      hostname:
+        description: 'Stable preview hostname for this PR'
+        required: true
+        type: string
+      generation:
+        description: 'Renewal generation; 1 is the original build'
+        required: false
+        default: '1'
+        type: string
+
+run-name: Preview pr-${{ inputs.pr_number }} gen-${{ inputs.generation }}
 
 permissions: {}
 
 jobs:
   preview-environment:
-    timeout-minutes: 310
+    timeout-minutes: 355
     runs-on: ubuntu-latest
     steps:
-      - name: Create Tunnel
-        id: expose-tunnel
+      - name: Start tunnel
         env:
           CLOUDFLARED_VERSION: '2026.3.0'
+          TUNNEL_TOKEN: ${{ secrets[format('PREVIEW_TUNNEL_{0}', inputs.pr_number)] }}
+          PREVIEW_HOST: ${{ inputs.hostname }}
+          PR_NUMBER: ${{ inputs.pr_number }}
         run: |
           set -euo pipefail
 
-          # Install cloudflared (pinned for reproducibility)
+          if [ -z "$TUNNEL_TOKEN" ]; then
+            echo "::error::No PREVIEW_TUNNEL_${PR_NUMBER} secret on this repo."
+            echo "::error::ci-privileged sets it before dispatching this workflow."
+            exit 1
+          fi
+
           sudo curl -fsSL -o /usr/local/bin/cloudflared \
             "https://github.com/cloudflare/cloudflared/releases/download/${CLOUDFLARED_VERSION}/cloudflared-linux-amd64"
           sudo chmod +x /usr/local/bin/cloudflared
           cloudflared --version
 
-          # Start an account-less "quick tunnel" pointing at the (not-yet-running)
-          # server container. Cloudflare assigns the https://*.trycloudflare.com
-          # URL immediately — before the backend exists — so it can be handed off
-          # before any attacker-controlled code runs.
           log_file="$RUNNER_TEMP/cloudflared.log"
           : > "$log_file"
-
-          cloudflared tunnel \
-            --url http://localhost:3000 \
-            --no-autoupdate \
-            --logfile "$log_file" \
-            --loglevel info \
+          cloudflared tunnel --no-autoupdate --logfile "$log_file" --loglevel info \
+            run --token "$TUNNEL_TOKEN" \
             > "$RUNNER_TEMP/cloudflared.stdout" 2>&1 &
 
           pid=$!
           echo "$pid" > "$RUNNER_TEMP/cloudflared.pid"
-          echo "cloudflared PID: $pid"
 
-          # Wait up to 2 minutes for the URL to appear; fail fast if cloudflared exits.
-          url=''
+          # Wait for the tunnel to register a connection: until it does, the DNS
+          # record resolves but Cloudflare answers 1033.
           for _ in $(seq 1 60); do
-            url=$(grep -oE 'https://[a-zA-Z0-9-]+\.trycloudflare\.com' "$log_file" 2>/dev/null | head -n1 || true)
-            [ -n "$url" ] && break
+            grep -q 'Registered tunnel connection' "$log_file" 2>/dev/null && break
             if ! kill -0 "$pid" 2>/dev/null; then
-              echo "cloudflared exited before producing a URL"
+              echo "::error::cloudflared exited before registering a connection"
               cat "$log_file" || true
               exit 1
             fi
             sleep 2
           done
 
-          if [ -z "$url" ]; then
-            echo "Timed out waiting for tunnel URL"
-            cat "$log_file" || true
-            exit 1
-          fi
+          grep -q 'Registered tunnel connection' "$log_file" \
+            || { echo "::error::timed out waiting for tunnel registration"; cat "$log_file" || true; exit 1; }
 
-          echo "Tunnel URL: $url"
-          echo "tunnel-url=$url" >> "$GITHUB_OUTPUT"
-
-      # Mint a short-lived installation token from a DEDICATED, minimal GitHub
-      # App whose only permission is actions:write on ci-privileged. Even if it
-      # leaked, the blast radius is "trigger workflows on ci-privileged" — same
-      # as a scoped PAT, but org-owned and auto-expiring. This runs BEFORE any
-      # attacker-controlled code, and the token is revoked right after use below.
-      - name: Mint ci-privileged dispatch token
-        id: dispatch-token
-        uses: actions/create-github-app-token@bcd2ba49218906704ab6c1aa796996da409d3eb1 # v3.2.0
-        with:
-          client-id: ${{ vars.PREVIEW_DISPATCH_APP_CLIENT_ID }}
-          private-key: ${{ secrets.PREVIEW_DISPATCH_APP_PRIVATE_KEY }}
-          owner: twentyhq
-          repositories: ci-privileged
-          permission-actions: write
-          # Revoked explicitly right after use (below), so skip the action's
-          # end-of-job revoke which would otherwise run after untrusted code.
-          skip-token-revoke: true
-
-      - name: Dispatch PR comment to ci-privileged
-        # Runs BEFORE any attacker-controlled code (checkout/build/up). The token
-        # is used and then immediately revoked, so no usable credential remains
-        # on the runner while untrusted code executes.
-        env:
-          GH_TOKEN: ${{ steps.dispatch-token.outputs.token }}
-          PR_NUMBER: ${{ inputs.pr_number }}
-          TARGET_REPO: ${{ inputs.repo }}
-          TUNNEL_URL: ${{ steps.expose-tunnel.outputs.tunnel-url }}
-        run: |
-          set -euo pipefail
-          gh workflow run preview-env-comment.yaml --repo twentyhq/ci-privileged --ref main \
-            -f pr_number="$PR_NUMBER" \
-            -f repo="$TARGET_REPO" \
-            -f tunnel_url="$TUNNEL_URL"
-          # Revoke the installation token now — before checkout/build/up — so it
-          # can't be exfiltrated by attacker-controlled code later in the job.
-          gh api --method DELETE /installation/token || true
+          echo "Tunnel up at https://${PREVIEW_HOST}"
 
       - name: Checkout twentyhq/twenty at PR head
         uses: actions/checkout@v5
@@ -143,21 +108,16 @@ jobs:
           persist-credentials: false
 
       - name: Route Docker Hub pulls through a public mirror (no credentials)
-        # Public base images (postgres, redis, node) go through Google's
-        # mirror.gcr.io pull-through cache, which has far higher anonymous limits
-        # than Docker Hub — so no Docker Hub credential is needed on this runner.
         run: |
           set -euo pipefail
           echo '{ "registry-mirrors": ["https://mirror.gcr.io"] }' | sudo tee /etc/docker/daemon.json
           sudo systemctl restart docker
-          # Wait for the daemon to come back up before anything tries to use it.
           for _ in $(seq 1 30); do docker info >/dev/null 2>&1 && break; sleep 1; done
           docker info | sed -n '/Registry Mirrors/,/Live Restore/p' || true
 
       - name: Run compose setup
         run: |
           echo "Patching docker-compose.yml..."
-          # change image to localbuild using yq
           yq eval 'del(.services.server.image)' -i packages/twenty-docker/docker-compose.yml
           yq eval '.services.server.build.context = "../../"' -i packages/twenty-docker/docker-compose.yml
           yq eval '.services.server.build.dockerfile = "./packages/twenty-docker/twenty/Dockerfile"' -i packages/twenty-docker/docker-compose.yml
@@ -191,16 +151,15 @@ jobs:
 
       - name: Start services with correct SERVER_URL
         env:
-          TUNNEL_URL: ${{ steps.expose-tunnel.outputs.tunnel-url }}
+          PREVIEW_HOST: ${{ inputs.hostname }}
         run: |
           cd packages/twenty-docker/
 
-          echo "Setting SERVER_URL to $TUNNEL_URL"
+          echo "Setting SERVER_URL to https://$PREVIEW_HOST"
           sed -i '/SERVER_URL=/d' .env
           echo "" >> .env
-          echo "SERVER_URL=$TUNNEL_URL" >> .env
+          echo "SERVER_URL=https://$PREVIEW_HOST" >> .env
 
-          # Start the services
           echo "Docker compose up..."
           docker compose up -d || {
               echo "Docker compose failed to start"
@@ -236,7 +195,7 @@ jobs:
         working-directory: ./
 
       - name: Keep tunnel alive for 5 hours
-        run: timeout 300m sleep 18000 # Stop on whichever we reach first (300m or 5hour sleep)
+        run: timeout 325m sleep 19500 # Ends before the 355m job timeout so Cleanup runs
 
       - name: Cleanup
         if: always()
