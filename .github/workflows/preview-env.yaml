@@ -17,7 +17,7 @@ name: Preview Environment
 # pull-through mirror (mirror.gcr.io) configured below, which avoids Docker
 # Hub's anonymous rate limits without any credential.
 #
-# Lives in the PUBLIC ci-public repo so the 5h keepalive runs on free
+# Lives in the PUBLIC ci-public repo so the long keepalive runs on free
 # Actions minutes (private repos bill them).
 
 on:
@@ -39,12 +39,19 @@ on:
         description: 'Stable preview hostname for this PR'
         required: true
         type: string
+      generation:
+        description: 'Renewal generation; 1 is the original build'
+        required: false
+        default: '1'
+        type: string
+
+run-name: Preview pr-${{ inputs.pr_number }} gen-${{ inputs.generation }}
 
 permissions: {}
 
 jobs:
   preview-environment:
-    timeout-minutes: 310
+    timeout-minutes: 355
     runs-on: ubuntu-latest
     steps:
       - name: Start tunnel
@@ -184,7 +191,7 @@ jobs:
         working-directory: ./
 
       - name: Keep tunnel alive for 5 hours
-        run: timeout 300m sleep 18000 # Stop on whichever we reach first (300m or 5hour sleep)
+        run: timeout 325m sleep 19500 # Ends before the 355m job timeout so Cleanup runs
 
       - name: Cleanup
         if: always()
