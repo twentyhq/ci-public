@@ -37,6 +37,11 @@ on:
         description: 'Source repo (owner/name)'
         required: true
         type: string
+      app_paths:
+        description: 'Newline-separated twenty-apps folders changed in the PR, installed on the env after boot'
+        required: false
+        type: string
+        default: ''
 
 permissions: {}
 
@@ -179,8 +184,14 @@ jobs:
 
           echo "Generating secrets..."
           echo "" >> packages/twenty-docker/.env
-          echo "# === Randomly generated secrets ===" >> packages/twenty-docker/.env
-          echo "APP_SECRET=$(openssl rand -base64 32)" >> packages/twenty-docker/.env
+          echo "# === Secrets ===" >> packages/twenty-docker/.env
+          # The e2e APP_SECRET (read from the PR tree, not stored here) instead
+          # of a random one: it makes the seeded workspace's well-known API key
+          # valid, so the CLI can install apps on the env. This weakens nothing —
+          # the env's login is already public knowledge (SIGN_IN_PREFILLED with
+          # the seeded demo credentials, on a public tunnel).
+          APP_SECRET=$(grep '^APP_SECRET=' packages/twenty-server/.env.e2e-testing-server | cut -d= -f2-)
+          echo "APP_SECRET=${APP_SECRET}" >> packages/twenty-docker/.env
           echo "PG_DATABASE_PASSWORD=$(openssl rand -hex 16)" >> packages/twenty-docker/.env
           echo "SIGN_IN_PREFILLED=true" >> packages/twenty-docker/.env
           echo "IS_FEATURE_FLAG_MANAGEMENT_ENABLED=true" >> packages/twenty-docker/.env
@@ -234,6 +245,71 @@ jobs:
             exit 1
           fi
         working-directory: ./
+
+      - name: Setup Node.js
+        if: inputs.app_paths != ''
+        uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4.4.0
+        with:
+          node-version-file: '.nvmrc'
+          cache: yarn
+          cache-dependency-path: yarn.lock
+
+      # Installs each changed app on the env with the PR's own SDK CLI. The
+      # PR-built CLI is correct here — this env IS the PR's platform build, so
+      # apps exercising SDK capabilities landing in the same PR work. External
+      # parity against released Twenty is a different concern, covered by the
+      # standalone workflow documented in the twenty-docs preview-deployments
+      # page for dedicated app repositories.
+      - name: Install changed apps on the env
+        if: inputs.app_paths != ''
+        env:
+          APP_PATHS: ${{ inputs.app_paths }}
+        run: |
+          set -euo pipefail
+
+          # Defense-in-depth: only twenty-apps folders may reach the install
+          # loop, whatever the dispatcher sent.
+          while IFS= read -r app_path; do
+            [ -z "$app_path" ] && continue
+            if ! printf '%s' "$app_path" | grep -qE '^packages/twenty-apps/(examples|internal|public)/[a-z0-9][a-z0-9-]*$'; then
+              echo "::error::Not a twenty-apps folder: $app_path"
+              exit 1
+            fi
+          done <<< "$APP_PATHS"
+
+          corepack enable
+          yarn install --immutable
+          npx nx build twenty-sdk
+
+          # The seeded workspace's well-known API key, valid because the env
+          # runs the e2e APP_SECRET (see the compose setup step above).
+          mkdir -p ~/.twenty
+          cat > ~/.twenty/config.json <<'EOF'
+          {
+            "version": 1,
+            "remotes": {
+              "preview": {
+                "apiUrl": "http://localhost:3000",
+                "apiKey": "eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJzdWIiOiIyMDIwMjAyMC0xYzI1LTRkMDItYmYyNS02YWVjY2Y3ZWE0MTkiLCJ0eXBlIjoiQVBJX0tFWSIsIndvcmtzcGFjZUlkIjoiMjAyMDIwMjAtMWMyNS00ZDAyLWJmMjUtNmFlY2NmN2VhNDE5IiwiaWF0IjoxNzM1Njg5NjAwLCJleHAiOjQ4OTE0NDk2MDAsImp0aSI6IjIwMjAyMDIwLWY0MDEtNGQ4YS1hNzMxLTY0ZDAwN2MyN2JhZCJ9.bfQjfyN0NEtTCLE_xPyNcwonDzlSXFoP8kdCQTdnuDc"
+              }
+            },
+            "defaultRemote": "preview"
+          }
+          EOF
+
+          # A broken app must not take the whole env down with it: platform
+          # reviewers still need the preview. Warn and keep going.
+          while IFS= read -r app_path; do
+            [ -z "$app_path" ] && continue
+            echo "Installing $app_path"
+            if ! (
+              cd "$app_path" &&
+              node "$GITHUB_WORKSPACE/packages/twenty-sdk/dist/cli.cjs" app:publish --private --remote preview &&
+              node "$GITHUB_WORKSPACE/packages/twenty-sdk/dist/cli.cjs" app:install --remote preview
+            ); then
+              echo "::warning::Installing $app_path failed — the preview env stays up without it."
+            fi
+          done <<< "$APP_PATHS"
 
       - name: Keep tunnel alive for 5 hours
         run: timeout 300m sleep 18000 # Stop on whichever we reach first (300m or 5hour sleep)
