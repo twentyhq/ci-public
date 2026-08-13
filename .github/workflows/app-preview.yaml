@@ -1,0 +1,294 @@
+name: App Preview
+
+# Dispatched from twentyhq/twenty's `.github/workflows/app-preview-dispatch.yaml`
+# via workflow_dispatch.
+#
+# Boots a STOCK `twentycrm/twenty-app-dev` image — the released all-in-one
+# instance app developers build against — and installs the PR's app on it the
+# way an external developer would: the app's own pinned `twenty-sdk` CLI from
+# npm, never a CLI or server built from the PR. The PR's server/front changes
+# are deliberately invisible here; that is the point of the preview.
+#
+# Installing the app runs attacker-controlled code from the PR head (its
+# devDependencies' lifecycle scripts and the SDK bundler over its sources), so
+# this job must be treated as fully compromised from the "Install app" step on.
+# Therefore no secret is reachable by attacker code at all: the cloudflared
+# tunnel is started and its URL is dispatched back to ci-privileged BEFORE any
+# attacker-controlled code runs. The dispatch uses a short-lived token from a
+# dedicated, minimal GitHub App (actions:write on ci-privileged only), revoked
+# immediately after use — so no usable credential remains on the runner while
+# untrusted code executes. ci-privileged holds the App key that can write to
+# twenty and posts the PR comment.
+#
+# The only credential used afterwards is the app-dev image's well-known seeded
+# API key, which is only valid against the throwaway container on this runner.
+#
+# Lives in the PUBLIC ci-public repo so the 5h keepalive runs on free
+# Actions minutes (private repos bill them).
+
+on:
+  workflow_dispatch:
+    inputs:
+      pr_number:
+        description: 'PR number on twentyhq/twenty'
+        required: true
+        type: string
+      pr_head_sha:
+        description: 'PR head SHA to check the app folder out from'
+        required: true
+        type: string
+      repo:
+        description: 'Source repo (owner/name)'
+        required: true
+        type: string
+      app_path:
+        description: 'App folder path (e.g. "packages/twenty-apps/examples/media-notes")'
+        required: true
+        type: string
+      app_name:
+        description: 'App folder name (e.g. "media-notes")'
+        required: true
+        type: string
+      twenty_version:
+        description: 'twentycrm/twenty-app-dev image tag to preview on'
+        required: false
+        type: string
+        default: 'latest'
+
+permissions: {}
+
+# One live preview per PR and app: a new push replaces the previous tunnel
+# instead of stacking 5h keepalive runs.
+concurrency:
+  group: app-preview-${{ inputs.repo }}-${{ inputs.pr_number }}-${{ inputs.app_name }}
+  cancel-in-progress: true
+
+jobs:
+  app-preview:
+    timeout-minutes: 310
+    runs-on: ubuntu-latest
+    steps:
+      - name: Validate inputs
+        env:
+          APP_PATH: ${{ inputs.app_path }}
+          APP_NAME: ${{ inputs.app_name }}
+          TWENTY_VERSION: ${{ inputs.twenty_version }}
+        run: |
+          set -euo pipefail
+          # Both values are interpolated into paths and shell below; pin them
+          # to the only shapes the dispatcher can legitimately send.
+          if ! printf '%s' "$APP_PATH" | grep -qE '^packages/twenty-apps/(examples|internal|public)/[a-z0-9][a-z0-9-]*$'; then
+            echo "::error::app_path is not a twenty-apps folder: $APP_PATH"
+            exit 1
+          fi
+          if [ "$(basename "$APP_PATH")" != "$APP_NAME" ]; then
+            echo "::error::app_name '$APP_NAME' does not match app_path '$APP_PATH'"
+            exit 1
+          fi
+          if ! printf '%s' "$TWENTY_VERSION" | grep -qE '^[a-zA-Z0-9._-]+$'; then
+            echo "::error::twenty_version is not an image tag: $TWENTY_VERSION"
+            exit 1
+          fi
+
+      - name: Create Tunnel
+        id: expose-tunnel
+        env:
+          CLOUDFLARED_VERSION: '2026.3.0'
+        run: |
+          set -euo pipefail
+
+          # Install cloudflared (pinned for reproducibility)
+          sudo curl -fsSL -o /usr/local/bin/cloudflared \
+            "https://github.com/cloudflare/cloudflared/releases/download/${CLOUDFLARED_VERSION}/cloudflared-linux-amd64"
+          sudo chmod +x /usr/local/bin/cloudflared
+          cloudflared --version
+
+          # Start an account-less "quick tunnel" pointing at the (not-yet-running)
+          # app-dev container. Cloudflare assigns the https://*.trycloudflare.com
+          # URL immediately — before the backend exists — so it can be handed off
+          # before any attacker-controlled code runs.
+          log_file="$RUNNER_TEMP/cloudflared.log"
+          : > "$log_file"
+
+          cloudflared tunnel \
+            --url http://localhost:2021 \
+            --no-autoupdate \
+            --logfile "$log_file" \
+            --loglevel info \
+            > "$RUNNER_TEMP/cloudflared.stdout" 2>&1 &
+
+          pid=$!
+          echo "$pid" > "$RUNNER_TEMP/cloudflared.pid"
+          echo "cloudflared PID: $pid"
+
+          # Wait up to 2 minutes for the URL to appear; fail fast if cloudflared exits.
+          url=''
+          for _ in $(seq 1 60); do
+            url=$(grep -oE 'https://[a-zA-Z0-9-]+\.trycloudflare\.com' "$log_file" 2>/dev/null | head -n1 || true)
+            [ -n "$url" ] && break
+            if ! kill -0 "$pid" 2>/dev/null; then
+              echo "cloudflared exited before producing a URL"
+              cat "$log_file" || true
+              exit 1
+            fi
+            sleep 2
+          done
+
+          if [ -z "$url" ]; then
+            echo "Timed out waiting for tunnel URL"
+            cat "$log_file" || true
+            exit 1
+          fi
+
+          echo "Tunnel URL: $url"
+          echo "tunnel-url=$url" >> "$GITHUB_OUTPUT"
+
+      # Mint a short-lived installation token from a DEDICATED, minimal GitHub
+      # App whose only permission is actions:write on ci-privileged. Even if it
+      # leaked, the blast radius is "trigger workflows on ci-privileged" — same
+      # as a scoped PAT, but org-owned and auto-expiring. This runs BEFORE any
+      # attacker-controlled code, and the token is revoked right after use below.
+      - name: Mint ci-privileged dispatch token
+        id: dispatch-token
+        uses: actions/create-github-app-token@bcd2ba49218906704ab6c1aa796996da409d3eb1 # v3.2.0
+        with:
+          client-id: ${{ vars.PREVIEW_DISPATCH_APP_CLIENT_ID }}
+          private-key: ${{ secrets.PREVIEW_DISPATCH_APP_PRIVATE_KEY }}
+          owner: twentyhq
+          repositories: ci-privileged
+          permission-actions: write
+          # Revoked explicitly right after use (below), so skip the action's
+          # end-of-job revoke which would otherwise run after untrusted code.
+          skip-token-revoke: true
+
+      - name: Dispatch PR comment to ci-privileged
+        # Runs BEFORE any attacker-controlled code (checkout/install). The token
+        # is used and then immediately revoked, so no usable credential remains
+        # on the runner while untrusted code executes.
+        env:
+          GH_TOKEN: ${{ steps.dispatch-token.outputs.token }}
+          PR_NUMBER: ${{ inputs.pr_number }}
+          TARGET_REPO: ${{ inputs.repo }}
+          TUNNEL_URL: ${{ steps.expose-tunnel.outputs.tunnel-url }}
+          APP_NAME: ${{ inputs.app_name }}
+          TWENTY_VERSION: ${{ inputs.twenty_version }}
+          RUN_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
+        run: |
+          set -euo pipefail
+          gh workflow run app-preview-comment.yaml --repo twentyhq/ci-privileged --ref main \
+            -f pr_number="$PR_NUMBER" \
+            -f repo="$TARGET_REPO" \
+            -f tunnel_url="$TUNNEL_URL" \
+            -f app_name="$APP_NAME" \
+            -f twenty_version="$TWENTY_VERSION" \
+            -f run_url="$RUN_URL"
+          # Revoke the installation token now — before checkout/install — so it
+          # can't be exfiltrated by attacker-controlled code later in the job.
+          gh api --method DELETE /installation/token || true
+
+      - name: Checkout the app folder at PR head
+        uses: actions/checkout@v5
+        with:
+          repository: twentyhq/twenty
+          ref: ${{ inputs.pr_head_sha }}
+          persist-credentials: false
+          # Cone mode keeps repo-root files (.nvmrc) alongside the app folder.
+          sparse-checkout: ${{ inputs.app_path }}
+
+      - name: Route Docker Hub pulls through a public mirror (no credentials)
+        # Public images (twentycrm/twenty-app-dev) go through Google's
+        # mirror.gcr.io pull-through cache, which has far higher anonymous limits
+        # than Docker Hub — so no Docker Hub credential is needed on this runner.
+        run: |
+          set -euo pipefail
+          echo '{ "registry-mirrors": ["https://mirror.gcr.io"] }' | sudo tee /etc/docker/daemon.json
+          sudo systemctl restart docker
+          # Wait for the daemon to come back up before anything tries to use it.
+          for _ in $(seq 1 30); do docker info >/dev/null 2>&1 && break; sleep 1; done
+          docker info | sed -n '/Registry Mirrors/,/Live Restore/p' || true
+
+      - name: Start stock Twenty (twenty-app-dev image)
+        env:
+          TUNNEL_URL: ${{ steps.expose-tunnel.outputs.tunnel-url }}
+          TWENTY_VERSION: ${{ inputs.twenty_version }}
+        run: |
+          set -euo pipefail
+          # SERVER_URL must be the public tunnel origin at boot: cookies and
+          # redirects are minted against it, and cookie sessions are credentialed
+          # so the front only authenticates from the server's own origin.
+          docker run -d \
+            --name twenty-app-preview \
+            -p 2021:2021 \
+            -e NODE_PORT=2021 \
+            -e SERVER_URL="$TUNNEL_URL" \
+            -e MARKETPLACE_CATALOG_SYNC_CRON_ENABLED=false \
+            -e API_RATE_LIMITING_SHORT_LIMIT=100000 \
+            -e API_RATE_LIMITING_LONG_LIMIT=100000 \
+            "twentycrm/twenty-app-dev:${TWENTY_VERSION}"
+
+          echo "Waiting for Twenty to become healthy…"
+          TIMEOUT=300
+          ELAPSED=0
+          until curl -sf http://localhost:2021/healthz > /dev/null 2>&1; do
+            if [ "$ELAPSED" -ge "$TIMEOUT" ]; then
+              echo "::error::Twenty did not become healthy within ${TIMEOUT}s"
+              docker logs twenty-app-preview 2>&1 | tail -80
+              exit 1
+            fi
+            sleep 3
+            ELAPSED=$((ELAPSED + 3))
+          done
+          echo "Twenty is ready (took ~${ELAPSED}s)"
+
+      - name: Setup Node.js
+        uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4.4.0
+        with:
+          node-version-file: '.nvmrc'
+
+      # ATTACKER-CONTROLLED CODE RUNS FROM HERE ON: yarn lifecycle scripts and
+      # the SDK bundler execute the PR's code. No secret remains on the runner.
+      - name: Install the app the external-developer way
+        working-directory: ${{ inputs.app_path }}
+        env:
+          # Monorepo example apps ship no per-app lockfile (an external repo
+          # would commit one and keep immutable installs on).
+          YARN_ENABLE_IMMUTABLE_INSTALLS: 'false'
+        run: |
+          set -euo pipefail
+          corepack enable
+
+          # The app's own pinned twenty-sdk from npm — the same CLI an external
+          # developer runs. Never a CLI built from the PR.
+          yarn install
+
+          # The app-dev image ships a seeded workspace with a fixed, public API
+          # key; it is only valid against the throwaway container on this runner.
+          mkdir -p ~/.twenty
+          cat > ~/.twenty/config.json <<'EOF'
+          {
+            "version": 1,
+            "remotes": {
+              "preview": {
+                "apiUrl": "http://localhost:2021",
+                "apiKey": "eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJzdWIiOiIyMDIwMjAyMC0xYzI1LTRkMDItYmYyNS02YWVjY2Y3ZWE0MTkiLCJ0eXBlIjoiQVBJX0tFWSIsIndvcmtzcGFjZUlkIjoiMjAyMDIwMjAtMWMyNS00ZDAyLWJmMjUtNmFlY2NmN2VhNDE5IiwiaWF0IjoxNzM1Njg5NjAwLCJleHAiOjQ4OTE0NDk2MDAsImp0aSI6IjIwMjAyMDIwLWY0MDEtNGQ4YS1hNzMxLTY0ZDAwN2MyN2JhZCJ9.bfQjfyN0NEtTCLE_xPyNcwonDzlSXFoP8kdCQTdnuDc",
+                "accessToken": "eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJzdWIiOiIyMDIwMjAyMC0xYzI1LTRkMDItYmYyNS02YWVjY2Y3ZWE0MTkiLCJ0eXBlIjoiQVBJX0tFWSIsIndvcmtzcGFjZUlkIjoiMjAyMDIwMjAtMWMyNS00ZDAyLWJmMjUtNmFlY2NmN2VhNDE5IiwiaWF0IjoxNzM1Njg5NjAwLCJleHAiOjQ4OTE0NDk2MDAsImp0aSI6IjIwMjAyMDIwLWY0MDEtNGQ4YS1hNzMxLTY0ZDAwN2MyN2JhZCJ9.bfQjfyN0NEtTCLE_xPyNcwonDzlSXFoP8kdCQTdnuDc"
+              }
+            },
+            "defaultRemote": "preview"
+          }
+          EOF
+
+          yarn twenty app:publish --private --remote preview
+          yarn twenty app:install --remote preview
+          echo "App installed. Preview is live."
+
+      - name: Keep tunnel alive for 5 hours
+        run: timeout 300m sleep 18000 # Stop on whichever we reach first (300m or 5hour sleep)
+
+      - name: Cleanup
+        if: always()
+        run: |
+          if [ -f "$RUNNER_TEMP/cloudflared.pid" ]; then
+            kill "$(cat "$RUNNER_TEMP/cloudflared.pid")" 2>/dev/null || true
+          fi
+          docker rm -f twenty-app-preview 2>/dev/null || true
