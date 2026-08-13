@@ -185,10 +185,8 @@ jobs:
           echo "Generating secrets..."
           echo "" >> packages/twenty-docker/.env
           echo "# === Secrets ===" >> packages/twenty-docker/.env
-          # Must match the twenty-app-dev image: its APP_SECRET is what signs the
-          # dev API key the SDK ships with, and that key is what installs apps
-          # below. Public by design — the env already serves SIGN_IN_PREFILLED
-          # demo credentials on a public tunnel.
+          # Must match the twenty-app-dev image: its APP_SECRET signs the dev API
+          # key that installs apps below. Public, like the env's demo login.
           APP_SECRET=$(grep -oE 'APP_SECRET=[[:graph:]]+' packages/twenty-docker/twenty/Dockerfile | head -n1 | cut -d= -f2-)
           if [ -z "$APP_SECRET" ]; then
             echo "::warning::No APP_SECRET found in the app-dev image; falling back to a random one, app installs will fail."
@@ -257,16 +255,12 @@ jobs:
           cache: yarn
           cache-dependency-path: yarn.lock
 
-      # Installs each changed app on the env with the PR's own SDK CLI. The
-      # PR-built CLI is correct here — this env IS the PR's platform build, so
-      # apps exercising SDK capabilities landing in the same PR work. External
-      # parity against released Twenty is a different concern, covered by the
-      # standalone workflow documented in the twenty-docs preview-deployments
-      # page for dedicated app repositories.
+      # Installed with the PR's own SDK CLI: this env IS the PR's platform
+      # build, so an app using a capability from the same PR still works.
       - name: Install changed apps on the env
         if: inputs.app_paths != ''
-        # A broken app must not take the preview down with it, but it must not
-        # pass for a working one either: the step goes red, the job carries on.
+        # Red step, live env: a broken app shouldn't take the preview down,
+        # and shouldn't pass for a working one either.
         continue-on-error: true
         env:
           APP_PATHS: ${{ inputs.app_paths }}
@@ -287,8 +281,7 @@ jobs:
           yarn install --immutable
           npx nx build twenty-sdk
 
-          # The seeded workspace's well-known API key, valid because the env
-          # runs the app-dev APP_SECRET (see the compose setup step above).
+          # The seeded workspace's well-known dev API key.
           mkdir -p ~/.twenty
           cat > ~/.twenty/config.json <<'EOF'
           {
