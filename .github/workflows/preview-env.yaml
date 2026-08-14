@@ -8,11 +8,11 @@ name: Preview Environment
 # malicious PR can bind-mount the runner host and read anything in the job.
 #
 # Therefore no secret is reachable by attacker code at all. The cloudflared
-# tunnel is started and its URL is dispatched back to ci-privileged BEFORE any
+# tunnel is started and its URL is dispatched back to twenty-factory BEFORE any
 # attacker-controlled code runs (checkout/build/up). The dispatch uses a
 # short-lived token from a dedicated, minimal GitHub App (actions:write on
-# ci-privileged only), revoked immediately after use — so no usable credential
-# remains on the runner while untrusted code executes. ci-privileged holds the
+# twenty-factory only), revoked immediately after use — so no usable credential
+# remains on the runner while untrusted code executes. twenty-factory holds the
 # App key that can write to twenty and posts the PR comment.
 #
 # Base images (postgres, redis, node) are pulled anonymously through a public
@@ -104,24 +104,24 @@ jobs:
           echo "tunnel-url=$url" >> "$GITHUB_OUTPUT"
 
       # Mint a short-lived installation token from a DEDICATED, minimal GitHub
-      # App whose only permission is actions:write on ci-privileged. Even if it
-      # leaked, the blast radius is "trigger workflows on ci-privileged" — same
+      # App whose only permission is actions:write on twenty-factory. Even if it
+      # leaked, the blast radius is "trigger workflows on twenty-factory" — same
       # as a scoped PAT, but org-owned and auto-expiring. This runs BEFORE any
       # attacker-controlled code, and the token is revoked right after use below.
-      - name: Mint ci-privileged dispatch token
+      - name: Mint twenty-factory dispatch token
         id: dispatch-token
         uses: actions/create-github-app-token@bcd2ba49218906704ab6c1aa796996da409d3eb1 # v3.2.0
         with:
           client-id: ${{ vars.PREVIEW_DISPATCH_APP_CLIENT_ID }}
           private-key: ${{ secrets.PREVIEW_DISPATCH_APP_PRIVATE_KEY }}
           owner: twentyhq
-          repositories: ci-privileged
+          repositories: twenty-factory
           permission-actions: write
           # Revoked explicitly right after use (below), so skip the action's
           # end-of-job revoke which would otherwise run after untrusted code.
           skip-token-revoke: true
 
-      - name: Dispatch PR comment to ci-privileged
+      - name: Dispatch PR comment to twenty-factory
         # Runs BEFORE any attacker-controlled code (checkout/build/up). The token
         # is used and then immediately revoked, so no usable credential remains
         # on the runner while untrusted code executes.
@@ -132,7 +132,7 @@ jobs:
           TUNNEL_URL: ${{ steps.expose-tunnel.outputs.tunnel-url }}
         run: |
           set -euo pipefail
-          gh workflow run preview-env-comment.yaml --repo twentyhq/ci-privileged --ref main \
+          gh workflow run preview-env-comment.yaml --repo twentyhq/twenty-factory --ref main \
             -f pr_number="$PR_NUMBER" \
             -f repo="$TARGET_REPO" \
             -f tunnel_url="$TUNNEL_URL"
